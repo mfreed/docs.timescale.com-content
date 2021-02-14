@@ -2,216 +2,324 @@
 
 ## Overview [](overview)
 
-TimescaleDB is implemented as an extension on PostgreSQL, which means that it
-runs within an overall PostgreSQL instance.  The extension
-model allows the database to take advantage of many of the attributes of
-PostgreSQL such as reliability, security, and connectivity to a wide range of
-third-party tools.  At the same time, TimescaleDB leverages the high degree of
-customization available to extensions by adding hooks deep into PostgreSQL's
-query planner, data model, and execution engine.
+TimescaleDB is a **relational database for time-series data**.
 
-From a user perspective, TimescaleDB exposes what look like singular tables,
-called **hypertables**, that are actually an abstraction or a virtual view of
-many individual tables holding the data, called **chunks**.
+It is implemented as an extension to PostgreSQL, which means that it runs
+within an PostgreSQL server as part of the same process, with code that
+introduces new capabilities for time-series data management, new functions
+for data analytics, new query planner and query execution optimizations, and
+new storage mechanisms for more cost effective and performant analytics.
+Any operations to a PostgreSQL database that includes TimescaleDB (whether
+SELECTs or INSERTs, or schema management like creating indexes) are first
+processed by TimescaleDB to determine how they should be planned or
+executed against TimescaleDB's data structures.
+
+This extension model allows the database to take advantage of the richness of
+PostgreSQL, from 40+ data types (from integers, floats, strings, timestamps,
+to arrays and JSON data types), to a dozen types of indexes, to complex
+schemas, to an advanced query planner, and to a larger extension ecosystem
+that plays nicely with TimescaleDB (including geo-spatial support through
+PostGIS, monitoring with pg_stat_statements, foreign data wrappers, and more).
+
+This design also allows TimescaleDB to take advantage of PostgreSQL's maturity
+from a reliability, robustness, security, and ecosystem perspective.  One can
+use PostgreSQL's physical replication to create multiple replicas for higher-
+availability and scaling read queries; snapshots and incremental WAL streaming
+for continuous backups to support full point-in-time recovery; role-based
+access control at the schema, table, or even row-level; and integrations with
+a huge number of third-party connectors and systems that speak the standard
+PostgreSQL protocol, such as popular programming languages, ORMs, data science
+tools, streaming systems, ETL tools, visualization libraries and dashboards,
+and more.
+
+At the same time, TimescaleDB leverages the high degree of customization
+available to extensions by adding hooks deep into PostgreSQL's query planner,
+data and storage model, and execution engine. This allows for new,
+advanced capabilities designed specifically for time-series data, including:
+
+- **Transparent and automated time partitioning**, where time-series tables are
+  automatically and continuously "chunked" into smaller intervals to improve
+  performance and to unlock various data-management capabilities.  Data
+  and indexes for the latest chunks naturally remain in memory,
+  insuring fast inserts and performant queries to recent data.
+
+- **Native columnar compression** with advanced datatype-specific compression,
+  employing various best-in-class algorithms based on whether the data are
+  timestamps, integers, floats, strings, or others.  Users typically report 94-97\%
+  storage reduction and faster queries to compressed data.
+
+- **Continuous and real-time aggregations**, in which the database continually
+  and incrementally maintains a materialized view of aggregate time-series data
+  to improve query performance, while properly handling late data or data
+  backfills.  TimescaleDB even enables queries to transparently merge pre-
+  computed aggregates with the latest raw data to ensure always up-to-date
+  answers.
+
+- **Automated time-series data management features**, such as explicit or
+  policy-based data retention policies, data reordering policies, aggregation
+  and compression policies, downsampling policies, and more.
+
+- **In-database job-scheduling framework** to power both native policies and to
+  support user-defined actions, including those written in SQL or PL/pgSQL.
+
+- **Horizontally-scalable multi-node operation** to automatically and
+  elastically scale your time-series data across many TimescaleDB databases,
+  while still giving the abstraction of a single time-series table.
+
+To better understand TimescaleDB, we first want to better explain two main
+concepts of how TimescaleDB scales: its data abstractions of **hypertables**
+and **chunks** (and how these are stored and processed), and how TimescaleDB
+can deployed either in single-node mode, with physical replicas, or in multi-
+node mode to enable distributed hypertables.
+
+## Hypertables and Chunks [](hypertable-chunks)
+
+From a user's perspective, TimescaleDB exposes what look like singular tables,
+called **hypertables**. A hypertable is your primarily point of interaction
+with you data, as it provides the standard table abstraction that you can query
+via standard SQL.  Creating a hypertable in TimescaleDB takes two simple
+SQL commands: `CREATE TABLE` (with standard SQL syntax),
+followed by `SELECT create_hypertable()`.
+
+Virtually all user interactions with TimescaleDB are with hypertables.
+Inserting, updating, or deleting data, querying data via SELECTs, altering
+tables, adding new columns or indexes, JOINs with other tables or hypertables,
+and so forth can (and should) all be executed on the hypertable.
+
+However, hypertables are actually an abstraction or virtual view of
+many individual tables that actually store the data, called **chunks**.
 
 <img class="main-content__illustration" src="https://assets.iobeam.com/images/docs/illustration-hypertable-chunk.svg" alt="hypertable and chunks"/>
 
-Chunks are created by partitioning the hypertable's data into
-one or multiple dimensions: All hypertables are partitioned by a time interval,
-and can additionally be partitioned by a key such as device ID, location,
-user id, etc. We sometimes refer to this as partitioning across "time and space".
+### Partitioning in Hypertables[](hypertable-partitioning)
 
-## Terminology [](terminology)
+Chunks are created by partitioning a hypertable's data into one
+(or potentially multiple) dimensions. All hypertables are partitioned
+by the values belonging to a time column, which may be in timestamp,
+date, or various integer forms.  If the time partitioning interval is one
+day, for example, then rows with timestamps that belong to the same
+day are colocated within the same chunk, while rows belonging to
+different days belong to different chunks.
 
-### Hypertables [](hypertables)
-The primary point of interaction with your data is a hypertable,
-the abstraction of a single continuous table across all space and time
-intervals, such that one can query it via standard SQL.
+TimescaleDB creates these chunks automatically as rows are inserted into the
+database.  If the timestamp of a newly-inserted row belongs to a day not yet
+present in the database, TimescaleDB will create a new chunk corresponding to
+that day as part of the INSERT process. Otherwise, TimescaleDB will
+determine the existing chunk(s) to which the new row(s) belong, and
+insert the rows into the corresponding chunks.  The interval of a hypertable's
+partitioning can also be changed over time (e.g., to adapt to changing workload
+conditions, so in one example, a hypertable could initially create a new chunk
+per day and then change to a chunk every 6 hours as the workload increases).
 
-Virtually all user interactions with TimescaleDB are with hypertables. Creating
-tables and indexes, altering tables, inserting data, selecting data, etc. can
-(and should) all be executed on the hypertable. [[Jump to basic SQL operations][jumpSQL]]
+A hypertable can be partitioned by additional columns as well -- such as a device
+identifier, server or container id, user or customer id, location, stock ticker
+symbol, and so forth.  Such partitioning on this additional column typically
+employs hashing (mapping all devices or servers into a specific number of hash
+buckets), although interval-based partitioning can be employed here as well.
+We sometimes refer to hypertables partitioned by both time and this additional
+dimension as "time and space" partitions.
 
-A hypertable is defined by a standard schema with column names and
-types, with at least one column specifying a time value, and
-one (optional) column specifying an additional partitioning key.
+This time-and-space partitioning is primarily used for *distributed hypertables*.
+With such two-dimensional partitioning, each time interval will also be
+partitioned across multiple nodes comprising the distributed hypertables.
+In such cases, for the same hour, information about some portion of the
+devices will be stored on each node.  This allows multi-node TimescaleDB
+to parallelize inserts and queries for data during that time interval.
 
->:TIP: See our [data model][] for a further discussion of various
-ways to organize data, depending on your use cases;
-the simplest and most natural is in a "wide-table" like many
-relational databases.
-
-A single TimescaleDB deployment can store multiple hypertables, each
-with different schemas.
-
-Creating a hypertable in TimescaleDB takes two simple SQL
-commands: `CREATE TABLE` (with standard SQL syntax),
-followed by `SELECT create_hypertable()`.
-
-Indexes on time and the partitioning key are automatically created on hypertables,
-although additional indexes can also be created (and TimescaleDB supports the
-full range of PostgreSQL index types).
-
-### Chunks [](chunks)
-
-Internally, TimescaleDB automatically splits each
-hypertable into **chunks**, with each chunk corresponding to a specific time
-interval and a region of the partition key’s space (using hashing).
-These partitions are disjoint (non-overlapping), which helps the query planner
-to minimize the set of chunks it must touch to resolve a query.
+[//]: # (Comment: We should include an image that shows a chunk picture of a
+[//]: # partition pointing at multiple chunks, each chunk have some range of
+[//]: # data, and an index (binary tree-like data structure) associated with it
 
 Each chunk is implemented using a standard database table.  (In PostgreSQL
 internals, the chunk is actually a "child table" of the "parent" hypertable.)
+A chunk includes constraints that specify and enforce its partitioning ranges,
+e.g., that the time interval of the chunk covers
+['2020-07-01 00:00:00+00', '2020-07-02 00:00:00+00'),
+and all rows included in the chunk must have a time value within that
+range. Any space partitions will be reflected as chunk constraints as well.
+As these ranges and partitions are non-overlapping, all chunks in a
+hypertable are disjoint in their partitioning dimensional space.
 
-Chunks are right-sized, ensuring that all of the B-trees for a table’s
-indexes can reside in memory during inserts.  This avoids thrashing when
-modifying arbitrary locations in those trees.
+Knowledge of chunks' constraints are used heavily in internal database
+operations.  Rows inserted into a hypertable are "routed" to the right chunk
+based on the chunks' dimensions.  And queries to a hypertable use knowledge
+of these chunks' constraints to only "push down" a query to the proper
+chunks: If a query specifies that `time > now() - interval '1 week'`, for
+example, the database only executes the query against chunks covering
+the past week, and excludes any chunks before that time.  This happens
+transparently to the user, however, who simply queries the hypertable with
+a standard SQL statement.
 
-Further, by avoiding overly large chunks, we can avoid expensive "vacuuming"
-operations when removing deleted data according to automated retention policies.
-The runtime can perform such operations by simply dropping chunks (internal
-tables), rather than deleting individual rows.
+### Benefits of Hypertables and Chunks[](hypertable-benefits)
 
-## Native Compression [](native-compression)
+This chunk-based architecture benefits many aspects of time-series data
+management. These includes:
 
-Compression is powered by TimescaleDB’s built-in job scheduler framework. We
-leverage it to asynchronously convert individual chunks from an uncompressed
-row-based form to a compressed columnar form across a hypertable: Once a chunk
-is old enough, the chunk will be transactionally converted from the row to columnar form.
+- **In-memory Data**. Chunks can be configured (based on their time intervals)
+  so that the recent chunks (and their indexes) fit in memory.  This helps ensure that inserts to
+  recent time intervals, as well as queries to recent data, typically accesses
+  data already stored in memory, rather than from disk.  But TimescaleDB
+  doesn't *require* that chunks fit solely in memory (and otherwise error);
+  rather, the database follows LRU caching rules on disk pages to maintain
+  in-memory data and index caching.
 
-With native compression, even though a single hypertable in TimescaleDB will
-store data in both row and columnar forms, users don’t need to worry about
-this: they will continue to see a standard row-based schema when querying data.
-This is similar to building a view on the decompressed columnar data.
+- **Local Indexes**. Indexes are built on each chunk independently, rather than
+  a global index across all data. This similarly ensures that *both* data and
+  indexes from the latest chunks typically reside in memory, so that updating
+  indexes when inserting data remains fast.  And TimescaleDB can still ensure
+  global uniqueness on keys that include any partitioning keys, given the
+  disjoint nature of its chunks, i.e., given a unique (device_id, timestamp)
+  primary key, first identify the corresponding chunk given constraints, then
+  use one of that chunk's index to ensure uniqueness.  But this remains simple
+  to use with TimecaleDB's hypertable abstraction: Users simply create an index
+  on the hypertable, and these operations (and configurations) are pushed down
+  to both existing and new chunks.
 
-TimescaleDB enables this capability by both (1) transparently appending data
-stored in the standard row format with decompressed data from the columnar format,
-and (2) transparently decompressing individual columns from selected rows at query time.
+- **Easy Data Retention**.  In many time-series applications, whether based on
+  cost, storage, compliance, or other reasons, users often only want to retain
+  data only for a certain amount of time. With TimescaleDB, users can quickly
+  delete chunks based on their time ranges (e.g., all chunks whose data has
+  timestamps more than 6 months old). Even easier, useres can create a data
+  retention policy within TimescaleDB to make this automatic, which employs its
+  internal job-scheduling framework. Chunk-based deletion is fast -- it's simply
+  deleting a file from disk -- as opposed to deleting individual rows, which
+  requires more expensive "vacuum" operations to later garbage collect and
+  defragment these deleted rows.
 
-During a query, uncompressed chunks will be processed normally, while data from
-compressed chunks will first be decompressed and converted to a standard row
-format at query time, before being appended or merged into other data. This
-approach is compatible with everything you expect from TimescaleDB, such as
-relational JOINs and analytical queries, as well as aggressive constraint exclusion
-to avoid processing chunks.
+- **Age-Based Compression, Data Reordering, and More**.  Many other data
+  management features can also take advantage of this chunk-based architecture,
+  which allows users to execute specific commands on chunks or employ
+  hypertable policies to automate these actions.  These include TimescaleDB's
+  native compression, which convert chunks from their traditional row-major
+  form into a layout that is more columnar in nature, while employing
+  type-specific compression on each column. Or data reordering, which
+  asynchronously rewrites data stored on disk from the order it was inserted
+  into an order specified by the user based on a specified index. By reordering
+  data based on (device_id, timestap), for example, all data associated with a
+  specific device becomes written contiguously on disk, making "deep and
+  narrow" scans for a particular device's data much faster.
 
-For more information on using compression, please see our [Compression Operational Overview].
-For a deep dive on the design motivations and architecture supporting
-compression, read our [compression blog post].
+- ** Instant Multi-Node Elasticity**.  TimescaleDB supports horizontally
+  scaling across multiple nodes. Unlike traditional one-dimensional
+  database sharding, where shards must be migrated to a newly-added
+  server as part of the process of expanding the cluster, TimescaleDB
+  supports the elastic addition (or removal) of new servers without
+  requiring any immediate rebalancing. When a new server is added,
+  existing chunks can remain at their current location, while chunks
+  created for future time intervals are partitioned across the new set
+  of servers.  The TimescaleDB planner can then handle queries
+  across these reconfigurations, always knowing which nodes are
+  storing which chunks.  Server load subsequently can be rebalanced
+  either by asynchronously migrating chunks or handled via data
+  retention policies if desired.
+
+- **Data Replication**.  Chunks can be individually replicated across
+  nodes transactionally, either by configuring a replication factor on a
+  distributed hypertable (which occurs as part of a 2PC transaction at
+  insert time) or by copying an older chunk from one node to another
+  to increase its replication factor, e.g., after a node failure (coming soon).
+
+- **Data Migration**.  Chunks can be individually migrated transactionally.
+  This migration can be across tablespaces (disks) residing on a single
+  server, often as a form of data tiering; e.g., moving older data from a
+  faster, more expensive disks to slower, cheaper storage. This migration
+  can also occur across nodes in a distributed hypertable, e.g., in order to
+  asynchronous rebalance a cluster after adding a server or to prepare for
+  retiring a server (coming soon).
+
+[//]: # (Comment:  Should we add some pointers to other key capabilities,
+[//]: # such as native compression and continuous aggs?)
 
 
-## Single Node vs. Multi-Node [](single-node-vs-clustering)
+## Deployment Options: Single node, physical replicas, multi-node [](deployment-options)
+[//]: # (Comment:  Not sure "deployment options" is the right term...  "Scaling:" ?)
 
-TimescaleDB performs extensive partitioning both
-on **single-node** deployments as well as **multi-node** deployments.
-While
-partitioning is traditionally only used for scaling out across multiple
-machines, it also allows us to scale up to high write rates (and improved
-parallelized queries) even on single machines.
 
-The current open-source release of TimescaleDB only supports single-node
-deployments. Of note is that the single-node version of TimescaleDB has been
-benchmarked to over 10-billion-row hypertables on commodity machines without
-a loss in insert performance.
+[//]: # (Comment: Add image comparing single node, physical replication, multi-node)
 
-## Benefits of Single-node Partitioning [](benefits-chunking)
+TimescaleDB supports three main deployment options:  as an single database server,
+in a tradition primary/replica deployment, or in a multi-node deployment with horizontal
+scalability.
 
-A common problem with scaling database performance on a single machine
-is the significant cost/performance trade-off between memory and disk.
-Eventually, our entire dataset will not fit in memory, and we’ll need
-to write our data and indexes to disk.
+[//]: # (Comment: Is there a section on single node here)
 
-Once the data is sufficiently large that we can’t fit all pages of our indexes
-(e.g., B-trees) in memory, then updating a random part of the tree can involve
-swapping in data from disk.  And databases like PostgreSQL keep a B-tree (or
-other data structure) for each table index, in order for values in that
-index to be found efficiently. So, the problem compounds as you index more
-columns.
+### Primary / Backup Replication [](primary-backup-replication)
 
-But because each of the chunks created by TimescaleDB is itself stored as a
-separate database table, all of its indexes are built only across these much
-smaller tables rather than a single table representing the entire
-dataset. So if we size these chunks properly, we can fit the latest tables
-(and their B-trees) completely in memory, and avoid this swap-to-disk problem,
-while maintaining support for multiple indexes.
+[//]: # (Comment: Update this image: https://blog.timescale.com/content/images/2018/12/image-12.png )
 
-For more on the motivation and design of TimescaleDB, please see our
-[technical blog post][chunking].
+TimescaleDB supports streaming replication from a "primary" database server
+to separate "replica" servers, using the standard PostgreSQL physical
+replication protocol.  The protocol works by streaming records of database
+modifications from the primary server to one or more replicas, which can then
+be used as read-only nodes (to scale queries) or as failover servers (for high availability).
 
-## Distributed Hypertables [](distributed-hypertables)
+PostgreSQL streaming replication leverages the Write Ahead Log (WAL), which is
+an append-only series of instructions that captures every atomic database change.
+The replication works by continuously shipping segments of the WAL from the primary
+to any connected replicas. Each replica then applies the WAL changes and makes them
+available for querying, ensuring that operations to the primary are applied atomically
+and in an identical order to each replica.
 
-TimescaleDB supports distributing hypertables across multiple nodes
-(i.e., a cluster) by leveraging the same hypertable and chunk
-primitives as described above. This allows TimescaleDB to scale
-inserts and queries beyond the capabilities of a single TimescaleDB
-instance.
+TimescaleDB (from underlying PostgreSQL functionality) supports various
+options for physical replication that trade off performance and consistency.
 
-Distributed hypertables and regular hypertables look very similar, with
-the main difference being that distributed chunks are not stored locally. There
-are also some features of regular hypertables that distributed
-hypertables do not support (see section on [current limitations][distributed-hypertable-limitations]).
+Replication can occur synchronously.  When an insert or schema modification
+operation is executed on the primary, the operation is replicated (or even
+applied) to replicas before the primary returns any result.  This ensures that
+replicas always stay perfectly up-to-date.
 
-### Distributed Databases and Nodes
+Replication can also occur asynchronously.  Operations to the primary return
+to a client as soon as they are executed, but any changes are queued for
+asynchronous transmission to any replicas.  Asynchronous replicas are
+often used for ad-hoc data exploration, to avoid heavy query load on replicas
+from interfering with a production primary server.
 
-A distributed hypertable exists in a *distributed database* that
-consists of multiple databases stored across one or more TimescaleDB
-instances. A database that is part of a distributed database can
-assume the role of either an **access node** or a **data node** (but not both).
+In fact, a single TimescaleDB primary can have both synchronous and
+asynchronous replicas, for a mix of HA failover and read scaling.  The main
+limitation of primary/backup replication is that each server stores a *full copy*
+of the database.
 
-A client connects to an access node database. The access node then
-distributes the requests and queries appropriately to data nodes, and
-aggregates the results received from the data nodes.  Access nodes
-store cluster-wide information about the different data nodes as well
-as how chunks are distributed across those data nodes. Access nodes
-can also store non-distributed hypertables, as well as regular
-PostgreSQL tables.
+[//]: # ( Link to section on distributed hypertables?  Timescale Cloud? )
+
+### Multi-node TimescaleDB and Distributed Hypertables [](multi-node)
+
+TimescaleDB 2.0 also supports horizontally scaling across many servers.
+Instead of a primary node (and each replica) which stores the full copy
+of the data, a *distributed hypertable* can be spread across multiple
+nodes, such that each node only stores a portion of the distributed
+hypertable (namely, a subset of the chunks). This allows TimescaleDB
+to scale storage, inserts, and queries beyond the capabilities of a single
+TimescaleDB instance.  Distributed hypertables and regular hypertables
+look very similar, with the main difference being that distributed chunks
+are not stored locally (and some other [current limitations][distributed-hypertable-limitations]).
+
+In a multi-node deployment of TimescaleDB, a database can assume the
+role of either an **access node** or a **data node**; both run the identical
+TimescaleDB software for operational simplicity.
+
+[//]: # (Comment: Picture of access nodes and data nodes )
+
+A client connects to an access node database.  The client can
+create a distributed hypertable on the access node, which stores
+cluster-wide information about the different data nodes as well as
+how chunks belonging to distributed hypertables are spread
+across those data nodes. Access nodes can also store non-distributed
+hypertables, as well as regular PostgreSQL tables.
 
 Data nodes do not store cluster-wide information, and otherwise look
-just as if they were stand-alone TimescaleDB instances. You should not
-directly access hypertables or chunks on data nodes. Doing so might
-lead to inconsistent distributed hypertables.
+just as if they were stand-alone TimescaleDB instances.
 
-It is important to note that access nodes and data nodes both run TimescaleDB, and for all intents and
-purposes, act just like a single instance of TimescaleDB from an operational perspective.
+Clients interact with the distributed hypertable all through the access
+node, performing schema operations, inserting data, or querying the
+data as if it's a standard table. When receiving a query, the access
+node uses local information about chunks to determine to which data
+nodes to push down queries. Query optimizations across the cluster
+attempt to minimize data transferred between data nodes and the
+access node, such that aggregates are performed on data nodes
+whenever possible, and only aggregated or filtered results are passed
+back to the access node for merging and returning to a client.
 
-### Configuring Distributed Hypertables
-
-To ensure best performance, you should partition a distributed
-hypertable by both time and space. If you only partition data by
-time, that chunk will have to fill up before the access node chooses
-another data node to store the next chunk, so during that
-chunk's time interval, all writes to the latest interval will be
-handled by a single data node, rather than load balanced across all
-available data nodes. On the other hand, if you specify a space
-partition, the access node will distribute chunks across multiple data
-nodes based on the space partition so that multiple chunks are created
-for a given chunk time interval, and both reads and writes to that
-recent time interval will be load balanced across the cluster.
-
-By default, we automatically set the number of space partitions equal to the number of data nodes
-if a value is not specified. The system will also increase the number of space partitions, if necessary,
-when adding new data nodes. If setting manually, we recommend that the number of space partitions are
-equal or a multiple of the number of data nodes associated with the distributed hypertable for optimal data distribution
-across data nodes. In case of multiple space partitions, only the first space partition will be used to determine
-how chunks are distributed across servers.
-
-### Scaling distributed hypertables
-
-As time-series data grows, a common use case is to add data nodes to expand the storage and compute
-capacity of distributed hypertables. Thus, TimescaleDB can be elastically scaled out by simply adding data nodes to
-a distributed database.
-
-As mentioned earlier, TimescaleDB can (and will) adjust the number of space partitions as new data nodes are
-added. Although existing chunks will not have their space partitions updated, the new settings will be applied to
-newly created chunks. Because of this behavior, we do not need to move data between data nodes when the cluster size is
-increased, and simply update how data is distributed for the next time interval. Writes for new incoming data will
-leverage the new partitioning settings, while the access node can still support queries across all chunks (even those
-that were created using the old partitioning settings). Do note that although the number of space partitions
-can be changed, the column on which the data is partitioned can not be changed.
-
-<!--- Picture of blog post -->
-
-**Next:** Benefits of this architecture design? [TimescaleDB vs. PostgreSQL][TvsP]
+[//]: # ( Link to section on distributed hypertables?  Setting up on Cloud/Forge? )
 
 [data model]: /introduction/data-model
 [chunking]: https://www.timescale.com/blog/time-series-data-why-and-how-to-use-a-relational-database-instead-of-nosql-d0cd6975e87c#2362
